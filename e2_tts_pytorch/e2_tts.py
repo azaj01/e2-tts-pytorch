@@ -1142,6 +1142,8 @@ class E2TTS(Module):
         pretrained_vocos_path = 'charactr/vocos-mel-24khz',
         sampling_rate: int | None = None,
         velocity_consistency_weight = 0.,
+        model_output_clean = False, # https://arxiv.org/abs/2511.13720 and https://danijar.com/project/dreamer4/
+        eps = 1e-2
     ):
         super().__init__()
 
@@ -1239,6 +1241,11 @@ class E2TTS(Module):
         self.register_buffer('zero', tensor(0.), persistent = False)
         self.velocity_consistency_weight = velocity_consistency_weight
 
+        # model output is in data space and converted back to velocity
+
+        self.model_output_clean = model_output_clean
+        self.eps = eps
+
         # default vocos for mel -> audio
 
         self.vocos = Vocos.from_pretrained(pretrained_vocos_path) if use_vocos else None
@@ -1249,16 +1256,18 @@ class E2TTS(Module):
 
     def transformer_with_pred_head(
         self,
-        x: Float['b n d'],
+        noised: Float['b n d'],
         cond: Float['b n d'],
-        times: Float['b'],
+        times: Float['b'] | Float[''],
         mask: Bool['b n'] | None = None,
         text: Int['b nt'] | None = None,
         drop_text_cond: bool | None = None,
         return_drop_text_cond = False
     ):
-        seq_len = x.shape[-2]
+        batch, seq_len, _ = noised.shape
         drop_text_cond = default(drop_text_cond, self.training and random() < self.cond_drop_prob)
+
+        x = noised
 
         if self.concat_cond:
             # concat condition, given as using voicebox-like scheme
@@ -1293,12 +1302,22 @@ class E2TTS(Module):
 
         embed = self.maybe_reduce_freq(embed)
 
-        pred = self.to_pred(embed)
+        model_output = self.to_pred(embed)
+
+        # maybe convert prediction to velocity
+
+        if self.model_output_clean:
+            if times.ndim == 0:
+                times = repeat(times, '-> b', b = batch)
+
+            velocity = einx.divide('b n d, b', model_output - noised, (1. - times).clamp_min(self.eps))
+        else:
+            velocity = model_output
 
         if not return_drop_text_cond:
-            return pred
+            return velocity
 
-        return pred, drop_text_cond
+        return velocity, drop_text_cond
 
     def cfg_transformer_with_pred_head(
         self,
